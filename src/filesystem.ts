@@ -1033,6 +1033,19 @@ export class FileSystemService {
     const overwrite = params.overwrite === true;
 
     const targetInput = await this.resolveUploadTargetPath(params.path);
+
+    // Refuse "." and ".." segments outright (supplied path and the
+    // attachment-folder prefix alike): normalisation would collapse them, so
+    // two spellings would name one file and the returned path/embed would not
+    // match the file actually written.
+    if (targetInput.split('/').some((segment) => segment === '.' || segment === '..')) {
+      return {
+        success: false,
+        path: targetInput,
+        message: `Invalid path: ${targetInput}. "." and ".." segments are not allowed in upload paths.`
+      };
+    }
+
     const path = this.normalizePath(targetInput);
 
     if (path === '') {

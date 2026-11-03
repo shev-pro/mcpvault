@@ -36,13 +36,23 @@ function bytesOf(length: number, fill = 65): Uint8Array {
  * The contract explicitly accepts either.
  */
 async function expectRefused(promise: Promise<UploadResult>): Promise<void> {
+  let result: UploadResult;
   try {
-    const result = await promise;
-    expect(result.success).toBe(false);
+    result = await promise;
   } catch (error) {
+    // Only a rejection of the upload itself counts as a refusal here.
     expect(error).toBeInstanceOf(Error);
+    return;
   }
+  // Outside the catch: a successful upload must fail the test.
+  expect(result.success).toBe(false);
 }
+
+test("expectRefused fails when the upload succeeds", async () => {
+  await expect(
+    expectRefused(Promise.resolve({ success: true, path: "x" })),
+  ).rejects.toThrow();
+});
 
 let testVaultPath: string;
 let outsideDir: string;
@@ -582,5 +592,40 @@ describe("review fixes (PR #1)", () => {
     expect(await readFile(join(testVaultPath, "root.bin"))).toEqual(
       Buffer.from(bytesOf(3, 1)),
     );
+  });
+});
+
+describe("dot segments are refused (second review, PR #1)", () => {
+  test.each([
+    "missing/../a.bin",
+    "./b.bin",
+    "x/./c.bin",
+    "x/..",
+    "missing\\..\\d.bin",
+    ".\\e.bin",
+    "/./f.bin",
+    "/missing/../g.bin",
+  ])("refuses %s and writes nothing", async (path) => {
+    const result = await fileSystem.uploadFile({ path, contentBase64: b64(bytesOf(3)) });
+    expect(result.success).toBe(false);
+    const { readdir } = await import("fs/promises");
+    expect(await readdir(testVaultPath)).toEqual([]);
+  });
+
+  test("refuses an attachment folder setting with a dot segment", async () => {
+    await mkdir(join(testVaultPath, ".obsidian"), { recursive: true });
+    await writeFile(
+      join(testVaultPath, ".obsidian/app.json"),
+      JSON.stringify({ attachmentFolderPath: "Attachments/../Other" }),
+    );
+    const result = await fileSystem.uploadFile({ path: "pic.png", contentBase64: b64(bytesOf(3)) });
+    expect(result.success).toBe(false);
+    await expect(access(join(testVaultPath, "Other/pic.png"))).rejects.toThrow();
+  });
+
+  test("a name that only contains dots inside a segment is still allowed", async () => {
+    const result = await fileSystem.uploadFile({ path: "notes/v1..2.bin", contentBase64: b64(bytesOf(3)) });
+    expect(result.success).toBe(true);
+    expect(result.path).toBe("notes/v1..2.bin");
   });
 });
