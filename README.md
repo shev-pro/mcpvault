@@ -109,15 +109,16 @@ An MCP client starts MCPVault as a local stdio process and passes the vault path
 
 - AST-aware frontmatter updates preserve formatting for unchanged YAML fields.
 - Path checks block traversal, symlink escapes, dotfiles, `.obsidian`, `.git`, and `node_modules`.
-- Eighteen MCP tools cover note and file operations:
-  - File operations: `read_note`, `write_note`, `patch_note`, `delete_note`, `move_note`, `move_file`
+- Nineteen MCP tools cover note and file operations:
+  - File operations: `read_note`, `write_note`, `patch_note`, `delete_note`, `move_note`, `move_file`, `upload_file`
   - Partial reads: `get_note_outline`, `read_note_lines`
   - Directory and batch reads: `list_directory`, `read_multiple_notes`
   - Search: `search_notes` with multi-word matching and BM25 reranking
   - Metadata and tags: `get_frontmatter`, `update_frontmatter`, `get_notes_info`, `get_vault_stats`, `manage_tags`, `list_all_tags`
   - Wiki links: `wiki_link` resolves names and returns alternative paths when a name is ambiguous
 - `write_note` supports overwrite, append, and prepend modes.
-- `delete_note` and `move_file` require matching confirmation paths.
+- `delete_note` and `move_file` require matching confirmation paths. `upload_file` requires a matching `confirmPath` only when `overwrite` is true.
+- `upload_file` accepts any file type (not just notes), from base64 content or a downloaded URL, capped at 10 MiB by default (`--max-upload-mb` to change it).
 - Path arguments are trimmed before validation.
 - Search and batch tools return compact fields by default; set `prettyPrint: true` for expanded output.
 - The package exports TypeScript declarations and public types.
@@ -271,7 +272,19 @@ Repeat `--exclude <subtree>` to hide vault-relative folders from `search_notes` 
 ]
 ```
 
-MCPVault does not read Obsidian's `.obsidian/app.json`; exclusions stay explicit in the MCP server configuration.
+Exclusions stay explicit in the MCP server configuration; MCPVault does not read `.obsidian/app.json` for them. (`upload_file` is the one exception: it reads only the `attachmentFolderPath` key from `.obsidian/app.json` internally, to place bare-name uploads where Obsidian would — see [`upload_file`](#upload_file) below. `.obsidian/` itself stays blocked for every other tool and path.)
+
+**Upload size limit:**
+
+Uploads via `upload_file` are capped at 10 MiB by default. Pass `--max-upload-mb <n>` (or `--max-upload-mb=<n>`) to change it.
+
+```json
+"args": [
+  "@bitbonsai/mcpvault@latest",
+  "/Users/yourname/Documents/ResearchVault",
+  "--max-upload-mb", "25"
+]
+```
 
 **Configuration File Locations:**
 
@@ -828,6 +841,62 @@ Move or rename any file in the vault with binary-safe file operations (file-only
 
 **Confirmation:** `confirmOldPath` must match `oldPath`, and `confirmNewPath` must match `newPath`.
 
+### `upload_file`
+
+Upload a file — any type, not just notes — into the vault, either from inline base64 content or from a downloaded URL (e.g. a file a ChatGPT connector already uploaded). Provide exactly one of `contentBase64` or `file`.
+
+A bare file name with no folder (e.g. `"diagram.png"`) is placed in Obsidian's configured attachment folder (read from `.obsidian/app.json`); a path with a folder, or a leading `/`, is used exactly as given (`/` means vault root explicitly, even when an attachment folder is configured).
+
+**Request (base64 content):**
+
+```json
+{
+  "name": "upload_file",
+  "arguments": {
+    "path": "diagram.png",
+    "contentBase64": "iVBORw0KGgoAAAANSUhEUgAA..."
+  }
+}
+```
+
+**Request (downloaded file):**
+
+```json
+{
+  "name": "upload_file",
+  "arguments": {
+    "path": "attachments/report.pdf",
+    "file": {
+      "download_url": "https://files.example.com/abc123?token=...",
+      "file_id": "abc123",
+      "mime_type": "application/pdf",
+      "file_name": "report.pdf"
+    }
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "path": "diagram.png",
+  "size": 4821,
+  "embed": "![[diagram.png]]",
+  "overwritten": false
+}
+```
+
+On refusal: `{ "success": false, "path": "...", "message": "..." }` (never the base64 content or the download URL).
+
+**Limits and safety:**
+
+- Capped at 10 MiB by default; see `--max-upload-mb` above.
+- Download URLs must be `https://` and cannot resolve to loopback, private, link-local, or other internal/non-routable addresses; redirects are followed (up to 5 hops) and re-validated the same way.
+- An existing file is never overwritten unless `overwrite: true` **and** `confirmPath` repeats `path`.
+- Disabled in `--read-only` mode, like every other mutating tool.
+
 ### `read_multiple_notes`
 
 Read multiple notes in a batch (maximum 10 files).
@@ -969,7 +1038,7 @@ MCPVault applies these checks before file operations:
 ### File Filtering
 
 - **Automatic Exclusions:** `.obsidian`, `.git`, `node_modules`, and system files are filtered
-- **Extension Whitelist:** Only `.md`, `.markdown`, `.txt`, `.base`, and `.canvas` files are accessible by default
+- **Extension Whitelist:** Only `.md`, `.markdown`, `.txt`, `.base`, and `.canvas` files are accessible by default via note tools; `upload_file` and `move_file` are binary-safe and accept any extension, but the same `.obsidian`/`.git`/dotfile/system-path exclusions still apply
 - **Hidden File Protection:** Dot files and system directories are automatically excluded
 
 ### Content Validation
@@ -977,13 +1046,15 @@ MCPVault applies these checks before file operations:
 - **YAML Frontmatter Validation:** Frontmatter is parsed and validated before writing
 - **Function/Symbol Prevention:** Dangerous JavaScript objects are blocked from frontmatter
 - **Data Type Checking:** Only safe data types (strings, numbers, arrays, objects) allowed
+- **Upload Size Limit:** `upload_file` rejects content over the configured limit (10 MiB by default) before writing anything
+- **Upload Download Guard:** `upload_file`'s `file.download_url` source is restricted to `https://`, blocks loopback/private/link-local/CGNAT/other internal addresses (including DNS results and redirect targets), and times out — see [`upload_file`](#upload_file)
 
 ### Best Practices
 
 - **Least Privilege:** Server only accesses the specified vault directory
 - **Read-Only Mode:** Run with `--read-only` for sensitive vaults; mutating tools are hidden and rejected
 - **Backup Recommended:** Always backup your vault before using write operations
-- **Network Isolation:** Server uses stdio transport (no network exposure)
+- **Network Isolation:** The server itself uses stdio transport (no network exposure); the one exception is `upload_file`'s optional download of a `file.download_url`, which is outbound-only and guarded as above
 
 ### What's NOT Protected
 

@@ -37,6 +37,9 @@ Options:
                   May be passed alone, with true/false, or as --read-only=true
   --exclude PATH  Hide a vault-relative subtree from search and directory listings
                   Repeat for multiple subtrees; direct read/write tools are unaffected
+  --max-upload-mb <n>
+                  Maximum accepted upload_file size in megabytes (default: 10)
+                  May be passed as --max-upload-mb <n> or --max-upload-mb=<n>
 
 Examples:
   npx @bitbonsai/mcpvault
@@ -51,11 +54,17 @@ Examples:
 }
 // Remove runtime options before joining trailing args, preserving support for
 // unquoted vault paths with spaces. When omitted, use the current directory.
-const { vaultPathArg, readOnly, excludePaths } = parseCliArgs(cliArgs);
+const { vaultPathArg, readOnly, excludePaths, maxUploadMb } = parseCliArgs(cliArgs);
 const vaultPath = resolve(vaultPathArg || process.cwd());
+const maxUploadBytes = maxUploadMb !== undefined ? Math.floor(maxUploadMb * 1024 * 1024) : undefined;
 // Serve both the legacy handshake-based protocol and MCP 2026-07-28 from the
 // same process. The opening exchange selects the era for this connection.
-const serverHandle = serveStdio(() => createServer(vaultPath, { version: VERSION, readOnly, excludePaths }), { onerror: (error) => console.error(error) });
+const serverHandle = serveStdio(() => createServer(vaultPath, {
+    version: VERSION,
+    readOnly,
+    excludePaths,
+    ...(maxUploadBytes !== undefined ? { maxUploadBytes } : {}),
+}), { onerror: (error) => console.error(error) });
 // Exit when the client disconnects (stdin EOF) or the process is asked to
 // terminate. Hosts that don't send an MCP shutdown request otherwise leave
 // this process running forever, orphaned once stdin closes (#159).

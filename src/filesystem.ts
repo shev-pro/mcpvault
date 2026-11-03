@@ -1,13 +1,39 @@
 import { join, resolve, relative, dirname } from 'path';
 import { homedir } from 'os';
-import { readdir, stat, readFile, writeFile, open, unlink, mkdir, access, rename, copyFile } from 'node:fs/promises';
+import { readdir, stat, readFile, writeFile, open, unlink, mkdir, access, rename, copyFile, link } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { constants, lstatSync, realpathSync } from 'node:fs';
 import trash from 'trash';
 import { FrontmatterHandler } from './frontmatter.js';
 import { PathFilter } from './pathfilter.js';
 import { generateObsidianUri } from './uri.js';
-import type { ParsedNote, DirectoryListing, NoteWriteParams, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats, NoteHeading, ReadNoteLinesParams } from './types.js';
+import { downloadToBuffer } from './download.js';
+import type { ParsedNote, DirectoryListing, NoteWriteParams, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats, NoteHeading, ReadNoteLinesParams, UploadFileParams, UploadResult, UploadDownloadFn, FileSystemServiceOptions } from './types.js';
+
+/** Default cap on uploaded file size: 10 MiB. Overridable via FileSystemServiceOptions.maxUploadBytes. */
+export const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Strict base64 validation — Buffer.from(str, 'base64') decodes leniently,
+ * silently dropping characters outside the alphabet instead of rejecting the
+ * input (design brief I6). Empty string is valid (decodes to 0 bytes).
+ */
+function isValidBase64(value: string): boolean {
+  if (value === '') return true;
+  if (value.length % 4 !== 0) return false;
+  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$/.test(value);
+}
+
+/**
+ * Decoded byte length of a (already validated) base64 string, computed from
+ * its length and padding rather than by decoding it — lets the size limit be
+ * enforced before allocating a buffer for an oversized payload.
+ */
+function estimateBase64DecodedLength(base64: string): number {
+  if (base64.length === 0) return 0;
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return (base64.length / 4) * 3 - padding;
+}
 
 /**
  * Map a filesystem write failure to a clear, accurate Error.
@@ -60,11 +86,14 @@ export class FileSystemService {
   private pathFilter: PathFilter;
   // shortcut: instance-local locks only, add cross-process coordination if shared-vault writers need it.
   private writeChains = new Map<string, Promise<void>>();
+  private maxUploadBytes: number;
+  private download: UploadDownloadFn;
 
   constructor(
     private vaultPath: string,
     pathFilter?: PathFilter,
-    frontmatterHandler?: FrontmatterHandler
+    frontmatterHandler?: FrontmatterHandler,
+    options?: FileSystemServiceOptions
   ) {
     const resolved = resolve(vaultPath);
     try {
@@ -75,6 +104,8 @@ export class FileSystemService {
     }
     this.pathFilter = pathFilter || new PathFilter();
     this.frontmatterHandler = frontmatterHandler || new FrontmatterHandler();
+    this.maxUploadBytes = options?.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES;
+    this.download = options?.download ?? ((url, opts) => downloadToBuffer(url, { maxBytes: opts.maxBytes }));
   }
 
   /**
@@ -104,7 +135,15 @@ export class FileSystemService {
     return p;
   }
 
-  private resolvePath(relativePath: string, followSymlinks = false): string {
+  /**
+   * `filterMode` picks which PathFilter check validates the *resolved*
+   * target when `followSymlinks` is true: 'note' (isAllowed, extension
+   * whitelist — the default, used by every note-only caller) or 'any'
+   * (isAllowedForListing — no extension check, used by uploadFile and
+   * moveFile's binary-safe paths) so non-note callers don't duplicate this
+   * walk just to apply a different filter.
+   */
+  private resolvePath(relativePath: string, followSymlinks = false, filterMode: 'note' | 'any' = 'note'): string {
     const normalizedPath = this.normalizePath(relativePath);
 
     const fullPath = resolve(join(this.vaultPath, normalizedPath));
@@ -125,7 +164,11 @@ export class FileSystemService {
         }
         if (followSymlinks) {
           const target = resolve(realPath, relative(candidate, fullPath));
-          if (!this.pathFilter.isAllowed(relative(this.vaultPath, target))) {
+          const targetRelative = relative(this.vaultPath, target);
+          const allowed = filterMode === 'any'
+            ? this.pathFilter.isAllowedForListing(targetRelative)
+            : this.pathFilter.isAllowed(targetRelative);
+          if (!allowed) {
             throw new Error(`Access denied: ${relativePath}. The resolved target is restricted.`);
           }
           return target;
@@ -159,8 +202,8 @@ export class FileSystemService {
     return fullPath;
   }
 
-  private async withPathLock<T>(path: string, fn: (fullPath: string) => Promise<T>): Promise<T> {
-    const fullPath = this.resolvePath(path, true);
+  private async withPathLock<T>(path: string, fn: (fullPath: string) => Promise<T>, filterMode: 'note' | 'any' = 'note'): Promise<T> {
+    const fullPath = this.resolvePath(path, true, filterMode);
     const previous = this.writeChains.get(fullPath) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -176,7 +219,8 @@ export class FileSystemService {
     }
   }
 
-  private async atomicWrite(fullPath: string, content: string): Promise<void> {
+  /** `content` is utf-8 encoded when a string; a Uint8Array is written verbatim (uploadFile's binary payloads). */
+  private async atomicWrite(fullPath: string, content: string | Uint8Array): Promise<void> {
     let mode: number | undefined;
     try {
       const target = await stat(fullPath);
@@ -194,7 +238,11 @@ export class FileSystemService {
     const file = await open(tmpPath, 'wx', mode ?? 0o666);
     try {
       try {
-        await file.writeFile(content, 'utf-8');
+        if (typeof content === 'string') {
+          await file.writeFile(content, 'utf-8');
+        } else {
+          await file.writeFile(content);
+        }
         // Creation applies umask; existing notes must retain their exact permissions.
         if (mode !== undefined) await file.chmod(mode);
         await file.sync();
@@ -205,6 +253,34 @@ export class FileSystemService {
     } catch (error) {
       try { await unlink(tmpPath); } catch { /* best effort */ }
       throw error;
+    }
+  }
+
+  /**
+   * Create-only write for uploadFile's non-overwrite path (I2): write to a
+   * temp file, fsync, then `link` it onto the target — `link` fails EEXIST
+   * atomically if the target already exists (also racing other processes,
+   * unlike a prior `stat`/`access` check), so this is the actual no-clobber
+   * guarantee rather than the per-path lock (which only coordinates callers
+   * within this one service instance, see AGENTS.md).
+   */
+  private async createNoClobber(fullPath: string, content: Uint8Array): Promise<void> {
+    await mkdir(dirname(fullPath), { recursive: true });
+    const tmpPath = join(dirname(fullPath), `.mcpvault-${randomUUID()}.tmp`);
+    const file = await open(tmpPath, 'wx', 0o666);
+    try {
+      try {
+        await file.writeFile(content);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await link(tmpPath, fullPath);
+    } finally {
+      // Best effort regardless of outcome: a write/sync failure (ENOSPC, EIO) must
+      // not leak the temp file, and a successful link() also leaves a now-redundant
+      // tmp path (the target is a second hard link to the same inode) to clean up.
+      try { await unlink(tmpPath); } catch { /* best effort: already linked away, or never fully created */ }
     }
   }
 
@@ -865,6 +941,194 @@ export class FileSystemService {
         newPath,
         message: `Failed to move file: ${error instanceof Error ? error.message : 'Unknown error'}`
       };
+    }
+  }
+
+  /**
+   * Resolve Obsidian's configured attachment folder, for bare-name uploads
+   * (design brief I9). Reads `.obsidian/app.json` directly with `fs` — this
+   * is an internal implementation detail, never exposed as a tool, and
+   * `.obsidian/` itself stays blocked by PathFilter for every other path.
+   * Returns undefined (meaning: vault root) when the file is missing,
+   * unreadable, invalid JSON, `attachmentFolderPath` is absent/not a string/
+   * "/", or note-relative (starts with "./" — unsupported here since there is
+   * no "current note" for a standalone upload call; user decision: fall back
+   * to vault root rather than guess).
+   */
+  private async readAttachmentFolderPath(): Promise<string | undefined> {
+    try {
+      const raw = await readFile(join(this.vaultPath, '.obsidian', 'app.json'), 'utf-8');
+      const parsed = JSON.parse(raw);
+      const folder = parsed?.attachmentFolderPath;
+      if (typeof folder !== 'string') return undefined;
+      const trimmed = folder.trim();
+      if (trimmed === '' || trimmed === '/' || trimmed === '.' || trimmed.startsWith('./')) {
+        return undefined;
+      }
+      return trimmed.replace(/^\/+/, '').replace(/\/+$/, '');
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Decide the actual upload target before any of I1's checks run (design
+   * brief I9). The bare/explicit distinction is made on the raw input,
+   * before normalizePath's own leading-slash stripping would erase it:
+   *   - leading "/": vault root, explicitly — bypasses any configured
+   *     attachment folder even if one is set.
+   *   - contains "/" (no leading slash): an explicit relative path, used
+   *     exactly as given (parent directories are created as needed).
+   *   - bare file name (no "/" at all): placed in Obsidian's configured
+   *     attachment folder, or vault root when none is configured/valid.
+   * The result still goes through normalizePath and every I1 check exactly
+   * like any other path — a malicious app.json pointing at `.git` is refused
+   * there, not here.
+   */
+  private async resolveUploadTargetPath(rawPath: string): Promise<string> {
+    const trimmed = (rawPath ?? '').trim().replace(/\\/g, '/');
+    if (trimmed.startsWith('/')) {
+      return trimmed.replace(/^\/+/, '');
+    }
+    if (trimmed.includes('/')) {
+      return trimmed;
+    }
+    if (trimmed === '') {
+      return trimmed;
+    }
+    const attachmentFolder = await this.readAttachmentFolderPath();
+    return attachmentFolder ? `${attachmentFolder}/${trimmed}` : trimmed;
+  }
+
+  /**
+   * Upload a file (any extension, including none) into the vault from
+   * either base64-encoded content or a downloaded `file` source — exactly
+   * one of the two (I6). See design brief .aicc/design/vault-upload.md for
+   * the full invariant list (I1-I9); this method is the single owner of
+   * all of them except I4 (atomicWrite/createNoClobber) and I7 (download.ts).
+   */
+  async uploadFile(params: UploadFileParams): Promise<UploadResult> {
+    const overwrite = params.overwrite ?? false;
+
+    const targetInput = await this.resolveUploadTargetPath(params.path);
+    const path = this.normalizePath(targetInput);
+
+    if (path === '') {
+      return { success: false, path, message: 'Path is required for uploading a file.' };
+    }
+
+    // I1: same guard as moveFile — isAllowedForListing (not isAllowed: every
+    // extension is accepted for uploads, by user decision) then resolvePath,
+    // whose symlink-target check also uses the listing filter via filterMode 'any'.
+    if (!this.pathFilter.isAllowedForListing(path)) {
+      return {
+        success: false,
+        path,
+        message: `Access denied: ${path}. This path is restricted (system files like .obsidian, .git, and dotfiles are not accessible).`
+      };
+    }
+
+    let fullPath: string;
+    try {
+      fullPath = this.resolvePath(path, true, 'any');
+    } catch (error) {
+      return { success: false, path, message: error instanceof Error ? error.message : 'Access denied.' };
+    }
+
+    // Directory-target refusal: distinct from "already exists" (I2), which
+    // is enforced by the no-clobber write itself further down.
+    try {
+      const targetStat = await stat(fullPath);
+      if (targetStat.isDirectory()) {
+        return { success: false, path, message: `Cannot upload: ${path} is a directory.` };
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return { success: false, path, message: `Failed to inspect upload target: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      }
+    }
+
+    // I6: exactly one content source.
+    const hasBase64 = params.contentBase64 !== undefined;
+    const hasFile = params.file !== undefined;
+    if (hasBase64 === hasFile) {
+      return {
+        success: false,
+        path,
+        message: hasBase64
+          ? 'Exactly one content source is allowed: provide either contentBase64 or file, not both.'
+          : 'Exactly one content source is required: provide contentBase64 or file.'
+      };
+    }
+
+    // I3: overwrite requires the caller to repeat the path.
+    if (overwrite) {
+      const confirmPath = this.normalizePath(params.confirmPath ?? '');
+      if (confirmPath !== path) {
+        return {
+          success: false,
+          path,
+          message: 'Overwrite cancelled: confirmation path does not match. For safety, confirmPath must equal path.'
+        };
+      }
+    }
+
+    // I5 + I6: resolve bytes, enforcing the size limit before (estimate) and
+    // after (exact) decoding/downloading. Nothing is written if this fails.
+    let bytes: Uint8Array;
+    if (hasBase64) {
+      const base64 = params.contentBase64!;
+      if (!isValidBase64(base64)) {
+        return { success: false, path, message: 'Invalid content: contentBase64 is not valid base64.' };
+      }
+      if (estimateBase64DecodedLength(base64) > this.maxUploadBytes) {
+        return { success: false, path, message: `Upload refused: content exceeds the configured size limit of ${this.maxUploadBytes} bytes.` };
+      }
+      bytes = Buffer.from(base64, 'base64');
+      if (bytes.byteLength > this.maxUploadBytes) {
+        return { success: false, path, message: `Upload refused: content exceeds the configured size limit of ${this.maxUploadBytes} bytes.` };
+      }
+    } else {
+      const file = params.file!;
+      try {
+        bytes = await this.download(file.download_url, { maxBytes: this.maxUploadBytes });
+      } catch (error) {
+        // The download's own error already never contains the URL (I7's contract).
+        return { success: false, path, message: error instanceof Error ? error.message : 'Download refused.' };
+      }
+      if (bytes.byteLength > this.maxUploadBytes) {
+        return { success: false, path, message: `Upload refused: content exceeds the configured size limit of ${this.maxUploadBytes} bytes.` };
+      }
+    }
+
+    try {
+      return await this.withPathLock(path, async (lockedFullPath) => {
+        if (overwrite) {
+          await this.atomicWrite(lockedFullPath, bytes);
+        } else {
+          try {
+            await this.createNoClobber(lockedFullPath, bytes);
+          } catch (error) {
+            if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'EEXIST') {
+              return {
+                success: false,
+                path,
+                message: `Target file already exists: ${path}. Use overwrite=true (with matching confirmPath) to replace it.`
+              };
+            }
+            throw error;
+          }
+        }
+        return {
+          success: true,
+          path,
+          size: bytes.byteLength,
+          embed: `![[${path}]]`,
+          overwritten: overwrite
+        };
+      }, 'any');
+    } catch (error) {
+      return { success: false, path, message: classifyWriteError(error, path).message };
     }
   }
 

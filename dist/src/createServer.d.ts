@@ -10,6 +10,8 @@ export interface CreateServerOptions {
     readOnly?: boolean;
     /** Vault-relative subtrees hidden from search and directory listings. */
     excludePaths?: string[];
+    /** Maximum accepted upload_file size in bytes (default: 10 MiB). */
+    maxUploadBytes?: number;
 }
 export declare function createServer(vaultPath: string, options?: CreateServerOptions): Server;
 //# sourceMappingURL=createServer.d.ts.map

@@ -40,6 +40,7 @@ src/
   frontmatter.ts       # FrontmatterHandler — YAML parsing via gray-matter
   pathfilter.ts        # PathFilter — security layer for path validation
   search.ts            # SearchService — full-text search with token-optimized output
+  download.ts          # downloadToBuffer/isBlockedAddress — SSRF-guarded HTTPS download for upload_file
   uri.ts               # Obsidian URI generation
   types.ts             # All TypeScript interfaces
   *.test.ts            # Co-located test files
@@ -48,17 +49,19 @@ website-shibumi/       # Bun + Hono + TSX website serving mcpvault.org (separate
 
 ### Core Components
 
-**server.ts** — Entry point. Registers 18 MCP tools, handles CLI args (--help, --version, --read-only, vault path), initializes services, routes tool calls. Read-only mode hides mutating tools and rejects direct mutation calls. Auto-trims whitespace from all path arguments. Exits on stdin EOF / SIGTERM / SIGINT (graceful `server.close()`), otherwise hosts orphan the process (#159).
+**server.ts** — Entry point. Registers 19 MCP tools, handles CLI args (--help, --version, --read-only, --exclude, --max-upload-mb, vault path), initializes services, routes tool calls. Read-only mode hides mutating tools and rejects direct mutation calls. Auto-trims whitespace from all path arguments. Exits on stdin EOF / SIGTERM / SIGINT (graceful `server.close()`), otherwise hosts orphan the process (#159).
 
-**FileSystemService** (`src/filesystem.ts`): Orchestrates file ops with security. Path resolution validates the nearest existing ancestor for new paths and rejects dangling symlinks. Implements: read, write, patch, delete, move, list, batch read, outline and line-range reads, frontmatter update, tag management, vault stats. Uses native `fs/promises`. In-place note mutations queue by canonical target within one service instance, then write a hidden sibling, sync it, and rename it over the target. Existing symlinks and POSIX file modes are preserved. Move/delete paths keep their separate symlink behavior; locks do not coordinate other processes.
+**FileSystemService** (`src/filesystem.ts`): Orchestrates file ops with security. Path resolution validates the nearest existing ancestor for new paths and rejects dangling symlinks. Implements: read, write, patch, delete, move, upload, list, batch read, outline and line-range reads, frontmatter update, tag management, vault stats. Uses native `fs/promises`. In-place note mutations queue by canonical target within one service instance, then write a hidden sibling, sync it, and rename it over the target. Existing symlinks and POSIX file modes are preserved. Move/delete paths keep their separate symlink behavior; locks do not coordinate other processes. `uploadFile` is create-no-clobber by default (temp file + `link()`, which fails `EEXIST` atomically — stronger than the lock, which only coordinates this one instance) and only takes the overwrite path (temp + fsync + rename) when the caller repeats the path back as `confirmPath`.
 
 **FrontmatterHandler** (`src/frontmatter.ts`) — Parses/stringifies YAML frontmatter via `gray-matter`. Validates structure (blocks functions, symbols, invalid types). Preserves original content.
 
-**PathFilter** (`src/pathfilter.ts`) — Blocks `.obsidian/`, `.git/`, `node_modules/`, system files, dot files. Note tools allow `.md`, `.markdown`, `.txt`; directory listings may include other file types by filename. Checks path components independently.
+**PathFilter** (`src/pathfilter.ts`) — Blocks `.obsidian/`, `.git/`, `node_modules/`, system files, dot files. Note tools allow `.md`, `.markdown`, `.txt`; directory listings may include other file types by filename. Checks path components independently. Tools that handle non-note files (`move_file`, `upload_file`) use `isAllowedForListing` (no extension check) instead of `isAllowed`, including for the symlink-target re-check inside `resolvePath`/`withPathLock`, which now takes a `filterMode: 'note' | 'any'` so that re-check can use either filter without a second copy of the symlink walk.
 
 **SearchService** (`src/search.ts`) — Content and frontmatter search with multi-word matching and BM25 relevance reranking. Returns token-optimized results with minified field names: `{p, t, ex, mc, ln, uri}`. Max 20 results.
 
-### 18 MCP Tools
+**download.ts** (`src/download.ts`) — `downloadToBuffer`/`isBlockedAddress`, the SSRF guard behind `upload_file`'s `file.download_url` source. https-only, blocks loopback/private/link-local/CGNAT/unspecified/multicast/broadcast/ULA/IPv4-mapped addresses (by IP literal or by resolving every address a hostname has), manual redirects re-validated up to 5 hops, non-2xx refused, size capped by `Content-Length` and by a streamed running count, overall timeout (default 30s). Fetch and DNS lookup are injectable so tests never touch the network. Documented residual: DNS rebinding between the lookup check and the fetch connect (would need a dispatcher pinned to the checked IP).
+
+### 19 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -72,6 +75,7 @@ website-shibumi/       # Bun + Hono + TSX website serving mcpvault.org (separate
 | search_notes | Full-text search across vault content |
 | move_note | Move or rename a note |
 | move_file | Move or rename any file (binary-safe, file-only, requires path confirmation) |
+| upload_file | Upload a file (any type) from base64 content or a downloaded URL; create-no-clobber unless overwrite is confirmed |
 | read_multiple_notes | Batch read up to 10 notes |
 | update_frontmatter | Safely update YAML frontmatter |
 | get_notes_info | Get metadata without reading content |
@@ -137,7 +141,8 @@ When modifying file operations:
 - `dist/` is committed. Every src change needs `npm run build` + commit dist in the SAME change; src-only merges leave dist stale (happened twice: fde15eb engine swap, PR #151).
 - TypeScript toolchain upgrades change dist output (TS7 altered `.d.ts.map` sourcemaps only) — rebuild + commit dist after any TS bump or the dirty tree blocks automation that requires clean main.
 - Claude Code discovers skills only under `.claude/skills/`; repo keeps them in `skills/`. Committed symlink `.claude/skills/triage -> ../../skills/triage` bridges it — same pattern for any new skill.
-- `pathFilter.isAllowed` + `normalizePath` must guard EVERY new tool's path input (PR #146 blocker: `readNoteLines` skipped them = read `.obsidian/` files). Mirror `readNote`'s guard block.
+- `pathFilter.isAllowed` + `normalizePath` must guard EVERY new tool's path input (PR #146 blocker: `readNoteLines` skipped them = read `.obsidian/` files). Mirror `readNote`'s guard block. Tools that must accept non-note files (not just `.md`/`.markdown`/`.txt`/`.base`/`.canvas`) guard with `isAllowedForListing` instead — see `move_file` and `upload_file` — and must pass `filterMode: 'any'` into `resolvePath`/`withPathLock` too, or the symlink-target re-check silently falls back to the note-only filter and rejects every non-note extension.
+- `upload_file`'s bare-name attachment-folder resolution reads `.obsidian/app.json` directly with `fs` inside `FileSystemService` — never add a tool that exposes that file's contents; `.obsidian/` stays blocked by `PathFilter` for everything else.
 - Outline/heading parsing must be fence-aware: headings inside code fences do not count. Support backtick and tilde fences with up to three leading spaces, and require closing fences to use the same marker with at least the opening length.
 - Read-only mode is defense-in-depth: mutating tools are both omitted from `tools/list` and rejected in `tools/call`. Every new mutating tool must be added to `MUTATING_TOOLS` in `src/createServer.ts` and covered by the read-only regression.
 - Root server uses npm + `package-lock.json`; website uses Bun separately. Root `bun.lock` becomes stale/misleading; do not recreate.

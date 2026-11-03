@@ -15,6 +15,8 @@ export interface CreateServerOptions {
   readOnly?: boolean;
   /** Vault-relative subtrees hidden from search and directory listings. */
   excludePaths?: string[];
+  /** Maximum accepted upload_file size in bytes (default: 10 MiB). */
+  maxUploadBytes?: number;
 }
 
 const MUTATING_TOOLS = new Set([
@@ -25,6 +27,7 @@ const MUTATING_TOOLS = new Set([
   "move_file",
   "update_frontmatter",
   "manage_tags",
+  "upload_file",
 ]);
 
 function normalizeSubtree(path: string): string {
@@ -59,11 +62,17 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
     frontmatterHandler = new FrontmatterHandler(),
     readOnly = false,
     excludePaths = [],
+    maxUploadBytes,
   } = options;
 
   const defaultExcludePaths = mergeExcludePaths([], excludePaths);
   const resolvedVaultPath = resolve(vaultPath);
-  const fileSystem = new FileSystemService(resolvedVaultPath, pathFilter, frontmatterHandler);
+  const fileSystem = new FileSystemService(
+    resolvedVaultPath,
+    pathFilter,
+    frontmatterHandler,
+    maxUploadBytes !== undefined ? { maxUploadBytes } : {}
+  );
   const searchService = new SearchService(resolvedVaultPath, pathFilter);
 
   const server = new Server({ name, version }, {
@@ -181,6 +190,32 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
             },
             required: ["oldPath", "newPath", "confirmOldPath", "confirmNewPath"]
           }
+        },
+        {
+          name: "upload_file",
+          description: "Upload a file (image, PDF, or any other attachment — any extension, including none) into the vault, from either base64-encoded content or a downloaded file reference (e.g. a ChatGPT-provided upload). Provide exactly one of contentBase64 or file. A bare file name (no folder, no leading '/') is placed in Obsidian's configured attachment folder; a path with a folder, or a leading '/', is used as given (vault root, explicitly, for a leading '/'). Existing files are never overwritten unless overwrite is true and confirmPath repeats path.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Target path for the uploaded file, relative to vault root. A bare file name goes to Obsidian's configured attachment folder; a leading '/' means vault root explicitly, bypassing that folder." },
+              contentBase64: { type: "string", description: "Base64-encoded file content. Provide exactly one of contentBase64 or file." },
+              file: {
+                type: "object",
+                description: "A file reference to download instead of inlining base64 (e.g. a ChatGPT connector upload). Provide exactly one of contentBase64 or file.",
+                properties: {
+                  download_url: { type: "string", description: "HTTPS URL to download the file content from" },
+                  file_id: { type: "string", description: "Identifier for the uploaded file" },
+                  mime_type: { type: "string", description: "MIME type of the file (optional)" },
+                  file_name: { type: "string", description: "Original file name (optional)" }
+                },
+                required: ["download_url", "file_id"]
+              },
+              overwrite: { type: "boolean", description: "Allow overwriting an existing file (default: false). Requires confirmPath to repeat path.", default: false },
+              confirmPath: { type: "string", description: "Confirmation required when overwrite is true: must exactly match path" }
+            },
+            required: ["path"]
+          },
+          _meta: { "openai/fileParams": ["file"] }
         },
         {
           name: "read_multiple_notes",
@@ -438,6 +473,20 @@ export function createServer(vaultPath: string, options: CreateServerOptions = {
             confirmOldPath: trimmedArgs.confirmOldPath,
             confirmNewPath: trimmedArgs.confirmNewPath,
             overwrite: trimmedArgs.overwrite
+          });
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            isError: !result.success
+          };
+        }
+
+        case "upload_file": {
+          const result = await fileSystem.uploadFile({
+            path: trimmedArgs.path,
+            contentBase64: trimmedArgs.contentBase64,
+            file: trimmedArgs.file,
+            overwrite: trimmedArgs.overwrite,
+            confirmPath: trimmedArgs.confirmPath
           });
           return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

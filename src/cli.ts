@@ -2,6 +2,7 @@ export interface ParsedCliArgs {
   vaultPathArg: string;
   readOnly: boolean;
   excludePaths: string[];
+  maxUploadMb?: number;
 }
 
 /**
@@ -9,13 +10,36 @@ export interface ParsedCliArgs {
  * server as a side effect. Unknown positional arguments remain part of the
  * vault path so unquoted paths with spaces continue to work.
  */
+function parsePositiveFiniteNumber(value: string | undefined, flagName: string): number {
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`${flagName} requires a positive number`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${flagName} must be a positive number`);
+  }
+  return parsed;
+}
+
 export function parseCliArgs(args: string[]): ParsedCliArgs {
   const pathArgs: string[] = [];
   const excludePaths: string[] = [];
   let readOnly = false;
+  let maxUploadMb: number | undefined;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
+
+    if (arg === "--max-upload-mb") {
+      maxUploadMb = parsePositiveFiniteNumber(args[index + 1], "--max-upload-mb");
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--max-upload-mb=")) {
+      maxUploadMb = parsePositiveFiniteNumber(arg.slice("--max-upload-mb=".length), "--max-upload-mb");
+      continue;
+    }
 
     if (arg === "--read-only") {
       const next = args[index + 1]?.toLowerCase();
@@ -63,5 +87,6 @@ export function parseCliArgs(args: string[]): ParsedCliArgs {
     vaultPathArg: pathArgs.join(" ").trim(),
     readOnly,
     excludePaths,
+    ...(maxUploadMb !== undefined ? { maxUploadMb } : {}),
   };
 }
