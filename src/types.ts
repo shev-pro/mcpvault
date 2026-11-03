@@ -168,6 +168,49 @@ export interface ReadNoteLinesParams {
   endLine: number;
 }
 
+// Upload types
+/**
+ * A file reference to download rather than inline as base64 — e.g. the
+ * shape a ChatGPT connector attaches for an uploaded file. Exactly one of
+ * `contentBase64` (UploadFileParams) or `file` must be provided.
+ */
+export interface UploadFileSource {
+  download_url: string;
+  file_id: string;
+  mime_type?: string;
+  file_name?: string;
+}
+
+export interface UploadFileParams {
+  path: string;
+  contentBase64?: string;
+  file?: UploadFileSource;
+  overwrite?: boolean;
+  confirmPath?: string;
+}
+
+export interface UploadResult {
+  success: boolean;
+  path: string;
+  message?: string;
+  size?: number;
+  embed?: string;
+  overwritten?: boolean;
+}
+
+/** Injected downloader used by `uploadFile` for the `file` content source. */
+export type UploadDownloadFn = (
+  url: string,
+  options: { maxBytes: number },
+) => Promise<Uint8Array>;
+
+export interface FileSystemServiceOptions {
+  /** Maximum accepted upload size in bytes. Defaults to DEFAULT_MAX_UPLOAD_BYTES. */
+  maxUploadBytes?: number;
+  /** Override for downloading `file` sources; defaults to downloadToBuffer from ./download.js. */
+  download?: UploadDownloadFn;
+}
+
 // Vault statistics types
 export interface VaultStats {
   totalNotes: number;

@@ -1,5 +1,5 @@
 import { Server } from "@modelcontextprotocol/server";
-import { FileSystemService } from "./filesystem.js";
+import { DEFAULT_MAX_UPLOAD_BYTES, FileSystemService } from "./filesystem.js";
 import { FrontmatterHandler, parseFrontmatter } from "./frontmatter.js";
 import { PathFilter } from "./pathfilter.js";
 import { SearchService } from "./search.js";
@@ -13,6 +13,7 @@ const MUTATING_TOOLS = new Set([
     "move_file",
     "update_frontmatter",
     "manage_tags",
+    "upload_file",
 ]);
 function normalizeSubtree(path) {
     let relativePath = path.trim().replace(/\\/g, "/");
@@ -34,11 +35,25 @@ function isExcluded(path, excludePaths) {
     const normalizedPath = normalizeSubtree(path);
     return excludePaths.some((excluded) => normalizedPath === excluded || normalizedPath.startsWith(`${excluded}/`));
 }
+/** The MCP SDK's own stdio read-buffer cap (STDIO_DEFAULT_MAX_BUFFER_SIZE). */
+const SDK_STDIO_DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
+/** Room for the JSON-RPC envelope and the other upload_file arguments. */
+const STDIO_MESSAGE_OVERHEAD = 1024 * 1024;
+/**
+ * Stdio read-buffer size that lets one upload_file call carry a base64 file at
+ * the upload limit: base64 is 4/3 of the bytes, plus the JSON-RPC envelope.
+ * Without it the SDK's 10 MiB default drops the connection on uploads above
+ * ~7.5 MiB. Never below the SDK default.
+ */
+export function stdioMaxBufferSize(maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES) {
+    const encoded = Math.ceil(maxUploadBytes / 3) * 4;
+    return Math.max(SDK_STDIO_DEFAULT_MAX_BUFFER, encoded + STDIO_MESSAGE_OVERHEAD);
+}
 export function createServer(vaultPath, options = {}) {
-    const { name = "mcpvault", version = "0.0.0", pathFilter = new PathFilter(), frontmatterHandler = new FrontmatterHandler(), readOnly = false, excludePaths = [], } = options;
+    const { name = "mcpvault", version = "0.0.0", pathFilter = new PathFilter(), frontmatterHandler = new FrontmatterHandler(), readOnly = false, excludePaths = [], maxUploadBytes, } = options;
     const defaultExcludePaths = mergeExcludePaths([], excludePaths);
     const resolvedVaultPath = resolve(vaultPath);
-    const fileSystem = new FileSystemService(resolvedVaultPath, pathFilter, frontmatterHandler);
+    const fileSystem = new FileSystemService(resolvedVaultPath, pathFilter, frontmatterHandler, maxUploadBytes !== undefined ? { maxUploadBytes } : {});
     const searchService = new SearchService(resolvedVaultPath, pathFilter);
     const server = new Server({ name, version }, {
         capabilities: { tools: {} },
@@ -154,6 +169,32 @@ export function createServer(vaultPath, options = {}) {
                     },
                     required: ["oldPath", "newPath", "confirmOldPath", "confirmNewPath"]
                 }
+            },
+            {
+                name: "upload_file",
+                description: "Upload a file (image, PDF, or any other attachment — any extension, including none) into the vault, from either base64-encoded content or a downloaded file reference (e.g. a ChatGPT-provided upload). Provide exactly one of contentBase64 or file. A bare file name (no folder, no leading '/') is placed in Obsidian's configured attachment folder; a path with a folder, or a leading '/', is used as given (vault root, explicitly, for a leading '/'). Existing files are never overwritten unless overwrite is true and confirmPath repeats path.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        path: { type: "string", description: "Target path for the uploaded file, relative to vault root. A bare file name goes to Obsidian's configured attachment folder; a leading '/' means vault root explicitly, bypassing that folder." },
+                        contentBase64: { type: "string", description: "Base64-encoded file content. Provide exactly one of contentBase64 or file." },
+                        file: {
+                            type: "object",
+                            description: "A file reference to download instead of inlining base64 (e.g. a ChatGPT connector upload). Provide exactly one of contentBase64 or file.",
+                            properties: {
+                                download_url: { type: "string", description: "HTTPS URL to download the file content from" },
+                                file_id: { type: "string", description: "Identifier for the uploaded file" },
+                                mime_type: { type: "string", description: "MIME type of the file (optional)" },
+                                file_name: { type: "string", description: "Original file name (optional)" }
+                            },
+                            required: ["download_url", "file_id"]
+                        },
+                        overwrite: { type: "boolean", description: "Allow overwriting an existing file (default: false). Requires confirmPath to repeat path.", default: false },
+                        confirmPath: { type: "string", description: "Confirmation required when overwrite is true: must exactly match path" }
+                    },
+                    required: ["path"]
+                },
+                _meta: { "openai/fileParams": ["file"] }
             },
             {
                 name: "read_multiple_notes",
@@ -395,6 +436,19 @@ export function createServer(vaultPath, options = {}) {
                         confirmOldPath: trimmedArgs.confirmOldPath,
                         confirmNewPath: trimmedArgs.confirmNewPath,
                         overwrite: trimmedArgs.overwrite
+                    });
+                    return {
+                        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                        isError: !result.success
+                    };
+                }
+                case "upload_file": {
+                    const result = await fileSystem.uploadFile({
+                        path: trimmedArgs.path,
+                        contentBase64: trimmedArgs.contentBase64,
+                        file: trimmedArgs.file,
+                        overwrite: trimmedArgs.overwrite,
+                        confirmPath: trimmedArgs.confirmPath
                     });
                     return {
                         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
