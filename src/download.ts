@@ -137,7 +137,27 @@ async function defaultLookup(hostname: string): Promise<Array<{ address: string;
  * addresses) and every resolved address is checked — a hostname with any
  * blocked address among several is refused.
  */
-async function validateHost(hostname: string, lookup: LookupFn): Promise<void> {
+/**
+ * Settle with `promise`, or reject as soon as `signal` aborts — so the
+ * download's single deadline also bounds work (DNS) that takes no signal.
+ */
+function withDeadline<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error("aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
+
+async function validateHost(rawHostname: string, lookup: LookupFn, signal: AbortSignal): Promise<void> {
+  // URL.hostname keeps the brackets of an IPv6 literal ("[::1]").
+  const hostname = rawHostname.startsWith("[") && rawHostname.endsWith("]")
+    ? rawHostname.slice(1, -1)
+    : rawHostname;
   if (isIPv4(hostname) || isIPv6(hostname)) {
     if (isBlockedAddress(hostname)) {
       throw new Error(`Download refused: host ${hostname} resolves to a restricted address`);
@@ -145,7 +165,15 @@ async function validateHost(hostname: string, lookup: LookupFn): Promise<void> {
     return;
   }
 
-  const addresses = await lookup(hostname);
+  let addresses: Array<{ address: string; family: number }>;
+  try {
+    addresses = await withDeadline(lookup(hostname), signal);
+  } catch {
+    // The resolver's own message is dropped: it is not needed and the rule is
+    // that nothing about the request leaks into errors.
+    if (signal.aborted) throw new Error("Download refused: timed out");
+    throw new Error(`Download refused: host ${hostname} could not be resolved`);
+  }
   for (const { address } of addresses) {
     if (isBlockedAddress(address)) {
       throw new Error(`Download refused: host ${hostname} resolves to a restricted address`);
@@ -238,7 +266,7 @@ export async function downloadToBuffer(url: string, options: DownloadOptions): P
       throw new Error("Download refused: only https URLs are allowed");
     }
 
-    await validateHost(parsed.hostname, lookup);
+    await validateHost(parsed.hostname, lookup, signal);
 
     let response: Response;
     try {

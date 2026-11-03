@@ -509,3 +509,78 @@ describe("file/download source", () => {
     await expect(access(join(testVaultPath, "failed.png"))).rejects.toThrow();
   });
 });
+
+describe("review fixes (PR #1)", () => {
+  test("a non-boolean overwrite (\"false\") is refused, original untouched", async () => {
+    await fileSystem.uploadFile({ path: "keep.bin", contentBase64: b64(bytesOf(3, 1)) });
+    await expectRefused(
+      fileSystem.uploadFile({
+        path: "keep.bin",
+        contentBase64: b64(bytesOf(3, 2)),
+        overwrite: "false" as unknown as boolean,
+        confirmPath: "keep.bin",
+      }),
+    );
+    expect(await readFile(join(testVaultPath, "keep.bin"))).toEqual(
+      Buffer.from(bytesOf(3, 1)),
+    );
+  });
+
+  test("a valid base64 payload near the default 10 MiB limit is accepted", async () => {
+    const big = new FileSystemService(testVaultPath);
+    const payload = bytesOf(9 * 1024 * 1024, 7);
+    const result = await big.uploadFile({ path: "big.bin", contentBase64: b64(payload) });
+    expect(result.success).toBe(true);
+    expect(result.size).toBe(payload.byteLength);
+    expect((await stat(join(testVaultPath, "big.bin"))).size).toBe(payload.byteLength);
+  });
+
+  test("a large payload with one invalid character is refused", async () => {
+    const big = new FileSystemService(testVaultPath);
+    const encoded = b64(bytesOf(6 * 1024 * 1024, 7));
+    const broken = encoded.slice(0, 1000) + "*" + encoded.slice(1001);
+    const result = await big.uploadFile({ path: "broken.bin", contentBase64: broken });
+    expect(result.success).toBe(false);
+    await expect(access(join(testVaultPath, "broken.bin"))).rejects.toThrow();
+  });
+
+  test("padding in the middle of base64 is refused", async () => {
+    const result = await fileSystem.uploadFile({ path: "pad.bin", contentBase64: "QQ==QUFB" });
+    expect(result.success).toBe(false);
+  });
+
+  test("a bare name in the attachment folder can be overwritten by repeating the bare name", async () => {
+    await mkdir(join(testVaultPath, ".obsidian"), { recursive: true });
+    await writeFile(
+      join(testVaultPath, ".obsidian/app.json"),
+      JSON.stringify({ attachmentFolderPath: "Attachments" }),
+    );
+    await fileSystem.uploadFile({ path: "report.pdf", contentBase64: b64(bytesOf(3, 1)) });
+    const result = await fileSystem.uploadFile({
+      path: "report.pdf",
+      contentBase64: b64(bytesOf(3, 2)),
+      overwrite: true,
+      confirmPath: "report.pdf",
+    });
+    expect(result.success).toBe(true);
+    expect(result.path).toBe("Attachments/report.pdf");
+    expect(await readFile(join(testVaultPath, "Attachments/report.pdf"))).toEqual(
+      Buffer.from(bytesOf(3, 2)),
+    );
+  });
+
+  test("confirmPath must repeat the supplied path, not an equivalent spelling", async () => {
+    await fileSystem.uploadFile({ path: "/root.bin", contentBase64: b64(bytesOf(3, 1)) });
+    await expectRefused(
+      fileSystem.uploadFile({
+        path: "/root.bin",
+        contentBase64: b64(bytesOf(3, 2)),
+        overwrite: true,
+        confirmPath: "root.bin",
+      }),
+    );
+    expect(await readFile(join(testVaultPath, "root.bin"))).toEqual(
+      Buffer.from(bytesOf(3, 1)),
+    );
+  });
+});

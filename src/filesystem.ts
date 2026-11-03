@@ -21,7 +21,20 @@ export const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 function isValidBase64(value: string): boolean {
   if (value === '') return true;
   if (value.length % 4 !== 0) return false;
-  return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$/.test(value);
+  // A character scan, not a regex: a repeated-group regex exhausts V8's regexp
+  // stack on multi-megabyte payloads well below the upload limit.
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const end = value.length - padding;
+  for (let i = 0; i < end; i++) {
+    const c = value.charCodeAt(i);
+    const isAlphabet =
+      (c >= 65 && c <= 90) || // A-Z
+      (c >= 97 && c <= 122) || // a-z
+      (c >= 48 && c <= 57) || // 0-9
+      c === 43 || c === 47; // + /
+    if (!isAlphabet) return false;
+  }
+  return true;
 }
 
 /**
@@ -1008,7 +1021,16 @@ export class FileSystemService {
    * all of them except I4 (atomicWrite/createNoClobber) and I7 (download.ts).
    */
   async uploadFile(params: UploadFileParams): Promise<UploadResult> {
-    const overwrite = params.overwrite ?? false;
+    // Tool arguments are not schema-validated by the server: a truthy
+    // non-boolean ("false") must never authorize an overwrite.
+    if (params.overwrite !== undefined && typeof params.overwrite !== 'boolean') {
+      return {
+        success: false,
+        path: typeof params.path === 'string' ? params.path.trim() : '',
+        message: 'Invalid overwrite: must be a boolean (true or false).'
+      };
+    }
+    const overwrite = params.overwrite === true;
 
     const targetInput = await this.resolveUploadTargetPath(params.path);
     const path = this.normalizePath(targetInput);
@@ -1061,10 +1083,14 @@ export class FileSystemService {
       };
     }
 
-    // I3: overwrite requires the caller to repeat the path.
+    // I3: overwrite requires the caller to repeat the path exactly as it
+    // supplied it (only surrounding whitespace is ignored) — compared before
+    // attachment-folder resolution, so a bare name is confirmed by the bare
+    // name and "/x" is not confirmed by "x".
     if (overwrite) {
-      const confirmPath = this.normalizePath(params.confirmPath ?? '');
-      if (confirmPath !== path) {
+      const suppliedPath = typeof params.path === 'string' ? params.path.trim() : '';
+      const confirmPath = typeof params.confirmPath === 'string' ? params.confirmPath.trim() : '';
+      if (confirmPath !== suppliedPath) {
         return {
           success: false,
           path,
@@ -1078,11 +1104,16 @@ export class FileSystemService {
     let bytes: Uint8Array;
     if (hasBase64) {
       const base64 = params.contentBase64!;
-      if (!isValidBase64(base64)) {
-        return { success: false, path, message: 'Invalid content: contentBase64 is not valid base64.' };
+      if (typeof base64 !== 'string') {
+        return { success: false, path, message: 'Invalid content: contentBase64 must be a string.' };
       }
+      // Size first (from the encoded length alone), so an oversized payload is
+      // refused before it is even scanned.
       if (estimateBase64DecodedLength(base64) > this.maxUploadBytes) {
         return { success: false, path, message: `Upload refused: content exceeds the configured size limit of ${this.maxUploadBytes} bytes.` };
+      }
+      if (!isValidBase64(base64)) {
+        return { success: false, path, message: 'Invalid content: contentBase64 is not valid base64.' };
       }
       bytes = Buffer.from(base64, 'base64');
       if (bytes.byteLength > this.maxUploadBytes) {

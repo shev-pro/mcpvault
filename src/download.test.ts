@@ -292,3 +292,50 @@ describe("downloadToBuffer", () => {
     expect(Buffer.compare(Buffer.from(result), Buffer.from(payload))).toBe(0);
   });
 });
+
+describe("review fixes (PR #1)", () => {
+  test("the timeout also covers a DNS lookup that never settles", async () => {
+    const lookup = vi.fn(() => new Promise<LookupResult>(() => {}));
+    const fetchImpl = vi.fn();
+    await expect(
+      downloadToBuffer("https://stuck.example/file", {
+        maxBytes: 100,
+        timeoutMs: 50,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookup,
+      }),
+    ).rejects.toThrow(/^Download refused: timed out/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  }, 1000);
+
+  test.each([
+    "https://[::1]/x",
+    "https://[::ffff:127.0.0.1]/x",
+    "https://[fd00::1]/x",
+  ])("refuses the bracketed IPv6 literal %s without DNS", async (url) => {
+    const lookup = vi.fn();
+    const fetchImpl = vi.fn();
+    await expect(
+      downloadToBuffer(url, {
+        maxBytes: 100,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookup: lookup as never,
+      }),
+    ).rejects.toThrow(/^Download refused: host .* restricted address/);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  test("a DNS failure is reported as a refusal without the URL", async () => {
+    const lookup = vi.fn(async () => {
+      throw new Error("getaddrinfo ENOTFOUND nowhere.example");
+    });
+    const promise = downloadToBuffer("https://nowhere.example/x?token=secret123", {
+      maxBytes: 100,
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+      lookup,
+    });
+    await expect(promise).rejects.toThrow(/^Download refused/);
+    await expect(promise).rejects.not.toThrow(/secret123/);
+  });
+});

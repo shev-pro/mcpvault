@@ -894,7 +894,7 @@ On refusal: `{ "success": false, "path": "...", "message": "..." }` (never the b
 
 - Capped at 10 MiB by default; see `--max-upload-mb` above.
 - Download URLs must be `https://` and cannot resolve to loopback, private, link-local, or other internal/non-routable addresses; redirects are followed (up to 5 hops) and re-validated the same way.
-- An existing file is never overwritten unless `overwrite: true` **and** `confirmPath` repeats `path`.
+- An existing file is never overwritten unless `overwrite: true` (a real boolean) **and** `confirmPath` repeats `path` exactly as you passed it (for a bare file name, the bare name).
 - Disabled in `--read-only` mode, like every other mutating tool.
 
 ### `read_multiple_notes`
