@@ -926,7 +926,9 @@ export class FileSystemService {
             const folder = parsed?.attachmentFolderPath;
             if (typeof folder !== 'string')
                 return undefined;
-            const trimmed = folder.trim();
+            // Same separator handling as the supplied path, so the dot-segment
+            // check in uploadFile sees "Attachments\..\Other" as ".." too.
+            const trimmed = folder.trim().replace(/\\/g, '/');
             if (trimmed === '' || trimmed === '/' || trimmed === '.' || trimmed.startsWith('./')) {
                 return undefined;
             }

@@ -629,3 +629,37 @@ describe("dot segments are refused (second review, PR #1)", () => {
     expect(result.path).toBe("notes/v1..2.bin");
   });
 });
+
+describe("attachment folder backslashes (third review, PR #1)", () => {
+  test.each(["Attachments\\..\\Other", ".\\Other", "Attachments\\.\\Other"])(
+    "refuses attachmentFolderPath %s and writes nothing",
+    async (folder) => {
+      await mkdir(join(testVaultPath, ".obsidian"), { recursive: true });
+      await writeFile(
+        join(testVaultPath, ".obsidian/app.json"),
+        JSON.stringify({ attachmentFolderPath: folder }),
+      );
+      const result = await fileSystem.uploadFile({ path: "pic.png", contentBase64: b64(bytesOf(3)) });
+      if (folder.startsWith(".\\")) {
+        // Note-relative spellings fall back to the vault root (I9), never into "Other".
+        expect(result.path).not.toContain("Other");
+      } else {
+        expect(result.success).toBe(false);
+      }
+      const { readdir } = await import("fs/promises");
+      const entries = (await readdir(testVaultPath, { recursive: true })) as string[];
+      expect(entries.filter((e) => e.includes("Other"))).toEqual([]);
+    },
+  );
+
+  test("a backslash-separated attachment folder is used with forward slashes", async () => {
+    await mkdir(join(testVaultPath, ".obsidian"), { recursive: true });
+    await writeFile(
+      join(testVaultPath, ".obsidian/app.json"),
+      JSON.stringify({ attachmentFolderPath: "assets\\img" }),
+    );
+    const result = await fileSystem.uploadFile({ path: "pic.png", contentBase64: b64(bytesOf(3)) });
+    expect(result.success).toBe(true);
+    expect(result.path).toBe("assets/img/pic.png");
+  });
+});

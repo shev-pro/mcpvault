@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { createServer } from "./src/createServer.js";
+import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { createServer, stdioMaxBufferSize } from "./src/createServer.js";
 import { parseCliArgs } from "./src/cli.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
@@ -64,7 +64,14 @@ const serverHandle = serveStdio(() => createServer(vaultPath, {
     readOnly,
     excludePaths,
     ...(maxUploadBytes !== undefined ? { maxUploadBytes } : {}),
-}), { onerror: (error) => console.error(error) });
+}), {
+    onerror: (error) => console.error(error),
+    // Sized from the upload limit: the SDK default (10 MiB) would drop the
+    // connection on a base64 upload above ~7.5 MiB.
+    transport: new StdioServerTransport(process.stdin, process.stdout, {
+        maxBufferSize: stdioMaxBufferSize(maxUploadBytes),
+    }),
+});
 // Exit when the client disconnects (stdin EOF) or the process is asked to
 // terminate. Hosts that don't send an MCP shutdown request otherwise leave
 // this process running forever, orphaned once stdin closes (#159).

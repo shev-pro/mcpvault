@@ -276,7 +276,7 @@ Exclusions stay explicit in the MCP server configuration; MCPVault does not read
 
 **Upload size limit:**
 
-Uploads via `upload_file` are capped at 10 MiB by default. Pass `--max-upload-mb <n>` (or `--max-upload-mb=<n>`) to change it.
+Uploads via `upload_file` are capped at 10 MiB by default. Pass `--max-upload-mb <n>` (or `--max-upload-mb=<n>`) to change it. The stdio message limit grows with it automatically (base64 is about 4/3 of the file, plus 1 MiB of headroom). If you put MCPVault behind an HTTP gateway or proxy, its request-body limit must allow the same size, e.g. about 15 MiB for the 10 MiB default.
 
 ```json
 "args": [

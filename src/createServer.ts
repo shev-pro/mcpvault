@@ -1,5 +1,5 @@
 import { Server, type Tool } from "@modelcontextprotocol/server";
-import { FileSystemService } from "./filesystem.js";
+import { DEFAULT_MAX_UPLOAD_BYTES, FileSystemService } from "./filesystem.js";
 import { FrontmatterHandler, parseFrontmatter } from "./frontmatter.js";
 import { PathFilter } from "./pathfilter.js";
 import { SearchService } from "./search.js";
@@ -52,6 +52,22 @@ function isExcluded(path: string, excludePaths: string[]): boolean {
   return excludePaths.some((excluded) =>
     normalizedPath === excluded || normalizedPath.startsWith(`${excluded}/`)
   );
+}
+
+/** The MCP SDK's own stdio read-buffer cap (STDIO_DEFAULT_MAX_BUFFER_SIZE). */
+const SDK_STDIO_DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
+/** Room for the JSON-RPC envelope and the other upload_file arguments. */
+const STDIO_MESSAGE_OVERHEAD = 1024 * 1024;
+
+/**
+ * Stdio read-buffer size that lets one upload_file call carry a base64 file at
+ * the upload limit: base64 is 4/3 of the bytes, plus the JSON-RPC envelope.
+ * Without it the SDK's 10 MiB default drops the connection on uploads above
+ * ~7.5 MiB. Never below the SDK default.
+ */
+export function stdioMaxBufferSize(maxUploadBytes: number = DEFAULT_MAX_UPLOAD_BYTES): number {
+  const encoded = Math.ceil(maxUploadBytes / 3) * 4;
+  return Math.max(SDK_STDIO_DEFAULT_MAX_BUFFER, encoded + STDIO_MESSAGE_OVERHEAD);
 }
 
 export function createServer(vaultPath: string, options: CreateServerOptions = {}): Server {
